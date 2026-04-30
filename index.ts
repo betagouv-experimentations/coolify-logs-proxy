@@ -47,11 +47,23 @@ async function coolify<T>(path: string): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+function unwrapList<T>(payload: unknown): T[] {
+  if (Array.isArray(payload)) return payload as T[];
+  if (payload && typeof payload === "object") {
+    const obj = payload as Record<string, unknown>;
+    for (const key of ["data", "deployments", "applications", "items", "results"]) {
+      if (Array.isArray(obj[key])) return obj[key] as T[];
+    }
+  }
+  return [];
+}
+
 async function listApps(): Promise<CoolifyApp[]> {
   if (appCache && Date.now() - appCache.fetchedAt < APP_CACHE_TTL_MS) {
     return appCache.apps;
   }
-  const apps = await coolify<CoolifyApp[]>("/api/v1/applications");
+  const raw = await coolify<unknown>("/api/v1/applications");
+  const apps = unwrapList<CoolifyApp>(raw);
   appCache = { apps, fetchedAt: Date.now() };
   return apps;
 }
@@ -82,12 +94,15 @@ async function handleLogs(repo: string, sha: string): Promise<Response> {
     return Response.json({ status: "not_found", reason: "app" }, { status: 404 });
   }
 
-  const list = await coolify<DeploymentSummary[]>(
+  const rawList = await coolify<unknown>(
     `/api/v1/deployments/applications/${app.uuid}?take=20`,
   );
+  const list = unwrapList<DeploymentSummary>(rawList);
   const match =
-    list.find((d) => (deploymentSha(d) ?? "").startsWith(sha) || sha.startsWith(deploymentSha(d) ?? "_")) ??
-    list[0];
+    list.find((d) => {
+      const dsha = deploymentSha(d) ?? "";
+      return dsha.startsWith(sha) || (dsha !== "" && sha.startsWith(dsha));
+    }) ?? list[0];
 
   if (!match) {
     return Response.json({ status: "not_found", reason: "deployment" }, { status: 404 });
@@ -123,6 +138,37 @@ Bun.serve({
 
     if (req.method === "GET" && url.pathname === "/healthz") {
       return Response.json({ ok: true });
+    }
+
+    if (req.method === "GET" && url.pathname === "/_debug/apps") {
+      try {
+        const raw = await coolify<unknown>("/api/v1/applications");
+        return Response.json({
+          shape: Array.isArray(raw) ? "array" : typeof raw,
+          keys: raw && typeof raw === "object" ? Object.keys(raw) : null,
+          sample: Array.isArray(raw) ? raw.slice(0, 1) : raw,
+        });
+      } catch (err) {
+        return Response.json({ error: (err as Error).message }, { status: 502 });
+      }
+    }
+
+    const debugDeploy = req.method === "GET"
+      ? /^\/_debug\/deployments\/([^/]+)\/?$/.exec(url.pathname)
+      : null;
+    if (debugDeploy) {
+      try {
+        const raw = await coolify<unknown>(
+          `/api/v1/deployments/applications/${debugDeploy[1]}?take=5`,
+        );
+        return Response.json({
+          shape: Array.isArray(raw) ? "array" : typeof raw,
+          keys: raw && typeof raw === "object" ? Object.keys(raw) : null,
+          sample: Array.isArray(raw) ? raw.slice(0, 1) : raw,
+        });
+      } catch (err) {
+        return Response.json({ error: (err as Error).message }, { status: 502 });
+      }
     }
 
     const m = req.method === "GET" ? logsPattern.exec(url.pathname) : null;
