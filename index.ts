@@ -129,12 +129,19 @@ async function handleLogs(repo: string, sha: string): Promise<Response> {
     return Response.json({ status: "not_found", reason: "deployment" }, { status: 404 });
   }
 
+  const deploymentPath = match.deployment_url ?? null;
+  const absoluteDeploymentUrl = deploymentPath
+    ? deploymentPath.startsWith("http")
+      ? deploymentPath
+      : `${COOLIFY_BASE_URL}${deploymentPath}`
+    : null;
+
   return Response.json({
     status: match.status ?? null,
     commit: deploymentSha(match) ?? null,
     commit_message: match.commit_message ?? null,
     deployment_uuid: match.deployment_uuid ?? null,
-    deployment_url: match.deployment_url ?? null,
+    deployment_url: absoluteDeploymentUrl,
     started_at: match.created_at ?? null,
     updated_at: match.updated_at ?? null,
     finished_at: match.finished_at ?? null,
@@ -160,47 +167,6 @@ Bun.serve({
 
     if (req.method === "GET" && url.pathname === "/healthz") {
       return Response.json({ ok: true });
-    }
-
-    if (req.method === "GET" && url.pathname === "/_debug/apps") {
-      try {
-        const raw = await coolify<unknown>("/api/v1/applications");
-        const list = unwrapList<Record<string, unknown>>(raw);
-        return Response.json({
-          shape: Array.isArray(raw) ? "array" : typeof raw,
-          count: list.length,
-          summary: list.map((a) => ({
-            uuid: a.uuid,
-            name: a.name,
-            git_repository: a.git_repository,
-            git_branch: a.git_branch,
-            fqdn: a.fqdn,
-          })),
-        });
-      } catch (err) {
-        return Response.json({ error: (err as Error).message }, { status: 502 });
-      }
-    }
-
-    const debugDeploy = req.method === "GET"
-      ? /^\/_debug\/deployments\/([^/]+)\/?$/.exec(url.pathname)
-      : null;
-    if (debugDeploy) {
-      try {
-        const raw = await coolify<unknown>(
-          `/api/v1/deployments/applications/${debugDeploy[1]}?take=5`,
-        );
-        const list = unwrapList<Record<string, unknown>>(raw);
-        return Response.json({
-          rawShape: Array.isArray(raw) ? "array" : typeof raw,
-          rawKeys: raw && typeof raw === "object" && !Array.isArray(raw) ? Object.keys(raw) : null,
-          count: list.length,
-          itemKeys: list[0] ? Object.keys(list[0]) : [],
-          sample: list.slice(0, 2),
-        });
-      } catch (err) {
-        return Response.json({ error: (err as Error).message }, { status: 502 });
-      }
     }
 
     const m = req.method === "GET" ? logsPattern.exec(url.pathname) : null;
