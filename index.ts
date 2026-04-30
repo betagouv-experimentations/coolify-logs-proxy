@@ -1,16 +1,23 @@
-// Public read-only proxy that exposes a single endpoint:
-//   GET /logs/{repo}/{sha}
-// returning the Coolify build/deploy status and last log lines for that
-// commit on the app whose Coolify "git_repository" ends in `/{repo}`.
+// Read-only proxy in front of the Coolify API. Exposes:
+//   GET /logs/{repo}/{sha}      → build/deploy status + last log lines
+//   GET /runtime-logs/{repo}    → live container logs of the deployed app
+//   GET /healthz                → liveness probe
 //
-// The Coolify token lives only in this process. Callers (Claude Code in
-// agent-vm, /save) do not need any credential.
+// All endpoints except /healthz require an Authorization header with a
+// GitHub PAT belonging to a member of GITHUB_ORG. The PM machine is
+// already authenticated to GitHub through `gh auth login`, so callers
+// pass `Authorization: Bearer $(gh auth token)`. No new credential to
+// distribute, no shared secret on PM machines.
 
 const COOLIFY_BASE_URL = requireEnv("COOLIFY_BASE_URL").replace(/\/$/, "");
 const COOLIFY_TOKEN = requireEnv("COOLIFY_TOKEN");
+const GITHUB_ORG = process.env.GITHUB_ORG ?? "betagouv-experimentations";
 const PORT = Number(process.env.PORT ?? 3000);
 const LOG_LINES = Number(process.env.LOG_LINES ?? 200);
 const APP_CACHE_TTL_MS = Number(process.env.APP_CACHE_TTL_MS ?? 5 * 60 * 1000);
+const MEMBERSHIP_CACHE_TTL_MS = Number(
+  process.env.MEMBERSHIP_CACHE_TTL_MS ?? 5 * 60 * 1000,
+);
 
 type CoolifyApp = {
   uuid: string;
@@ -40,6 +47,9 @@ type LogEntry = {
 
 type AppCacheEntry = { apps: CoolifyApp[]; fetchedAt: number };
 let appCache: AppCacheEntry | null = null;
+
+type MembershipResult = { ok: boolean; checkedAt: number; login?: string };
+const membershipCache = new Map<string, MembershipResult>();
 
 async function coolify<T>(path: string): Promise<T> {
   const res = await fetch(`${COOLIFY_BASE_URL}${path}`, {
@@ -90,9 +100,9 @@ function deploymentSha(d: DeploymentItem): string | undefined {
   return d.git_commit_sha ?? d.commit;
 }
 
-function shaMatches(deploymentSha: string, query: string): boolean {
-  if (!deploymentSha || !query) return false;
-  return deploymentSha.startsWith(query) || query.startsWith(deploymentSha);
+function shaMatches(sha: string, query: string): boolean {
+  if (!sha || !query) return false;
+  return sha.startsWith(query) || query.startsWith(sha);
 }
 
 function flattenLogs(rawLogs: string | undefined, max: number): string {
@@ -111,7 +121,7 @@ function flattenLogs(rawLogs: string | undefined, max: number): string {
   return tailLines(visible.join("\n"), max);
 }
 
-async function handleLogs(repo: string, sha: string): Promise<Response> {
+async function handleBuildLogs(repo: string, sha: string): Promise<Response> {
   const apps = await listApps();
   const app = findAppByRepo(apps, repo);
   if (!app) {
@@ -149,6 +159,72 @@ async function handleLogs(repo: string, sha: string): Promise<Response> {
   });
 }
 
+async function handleRuntimeLogs(repo: string, lines: number): Promise<Response> {
+  const apps = await listApps();
+  const app = findAppByRepo(apps, repo);
+  if (!app) {
+    return Response.json({ status: "not_found", reason: "app" }, { status: 404 });
+  }
+
+  const raw = await coolify<{ logs?: string } | unknown>(
+    `/api/v1/applications/${app.uuid}/logs?lines=${lines}`,
+  );
+  const logs =
+    raw && typeof raw === "object" && "logs" in raw && typeof (raw as { logs?: unknown }).logs === "string"
+      ? ((raw as { logs: string }).logs)
+      : typeof raw === "string"
+      ? raw
+      : "";
+
+  return Response.json({
+    repo,
+    app_uuid: app.uuid,
+    lines: logs.split(/\r?\n/).length,
+    logs: tailLines(logs, lines),
+  });
+}
+
+async function verifyMembership(token: string): Promise<MembershipResult> {
+  const cached = membershipCache.get(token);
+  if (cached && Date.now() - cached.checkedAt < MEMBERSHIP_CACHE_TTL_MS) {
+    return cached;
+  }
+  let result: MembershipResult = { ok: false, checkedAt: Date.now() };
+  try {
+    const res = await fetch(
+      `https://api.github.com/user/memberships/orgs/${GITHUB_ORG}`,
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/vnd.github+json",
+          "User-Agent": "coolify-logs-proxy",
+        },
+      },
+    );
+    if (res.ok) {
+      const body = (await res.json()) as { state?: string; user?: { login?: string } };
+      if (body.state === "active") {
+        result = {
+          ok: true,
+          checkedAt: Date.now(),
+          login: body.user?.login,
+        };
+      }
+    }
+  } catch (err) {
+    console.error("membership check failed:", err);
+  }
+  membershipCache.set(token, result);
+  return result;
+}
+
+function extractBearer(req: Request): string | null {
+  const h = req.headers.get("authorization") ?? req.headers.get("Authorization");
+  if (!h) return null;
+  const m = /^Bearer\s+(.+)$/i.exec(h.trim());
+  return m ? m[1]!.trim() : null;
+}
+
 function requireEnv(name: string): string {
   const value = process.env[name];
   if (!value) {
@@ -158,7 +234,8 @@ function requireEnv(name: string): string {
   return value;
 }
 
-const logsPattern = /^\/logs\/([^/]+)\/([^/]+)\/?$/;
+const buildLogsPattern = /^\/logs\/([^/]+)\/([^/]+)\/?$/;
+const runtimeLogsPattern = /^\/runtime-logs\/([^/]+)\/?$/;
 
 Bun.serve({
   port: PORT,
@@ -169,23 +246,61 @@ Bun.serve({
       return Response.json({ ok: true });
     }
 
-    const m = req.method === "GET" ? logsPattern.exec(url.pathname) : null;
-    if (m) {
-      const repo = decodeURIComponent(m[1]!);
-      const sha = decodeURIComponent(m[2]!);
-      try {
-        return await handleLogs(repo, sha);
-      } catch (err) {
-        console.error("logs handler error:", err);
-        return Response.json(
-          { status: "error", message: (err as Error).message },
-          { status: 502 },
-        );
+    if (req.method !== "GET") {
+      return new Response("Not found", { status: 404 });
+    }
+
+    const buildMatch = buildLogsPattern.exec(url.pathname);
+    const runtimeMatch = runtimeLogsPattern.exec(url.pathname);
+    if (!buildMatch && !runtimeMatch) {
+      return new Response("Not found", { status: 404 });
+    }
+
+    const token = extractBearer(req);
+    if (!token) {
+      return Response.json(
+        {
+          error: "missing_authorization",
+          hint: `Pass 'Authorization: Bearer $(gh auth token)' — your GitHub PAT, used to verify membership in ${GITHUB_ORG}.`,
+        },
+        { status: 401 },
+      );
+    }
+    const membership = await verifyMembership(token);
+    if (!membership.ok) {
+      return Response.json(
+        {
+          error: "forbidden",
+          hint: `Token holder is not an active member of ${GITHUB_ORG}.`,
+        },
+        { status: 403 },
+      );
+    }
+
+    try {
+      if (buildMatch) {
+        const repo = decodeURIComponent(buildMatch[1]!);
+        const sha = decodeURIComponent(buildMatch[2]!);
+        return await handleBuildLogs(repo, sha);
       }
+      if (runtimeMatch) {
+        const repo = decodeURIComponent(runtimeMatch[1]!);
+        const lines = Math.min(
+          Number(url.searchParams.get("lines") ?? LOG_LINES) || LOG_LINES,
+          2000,
+        );
+        return await handleRuntimeLogs(repo, lines);
+      }
+    } catch (err) {
+      console.error("handler error:", err);
+      return Response.json(
+        { status: "error", message: (err as Error).message },
+        { status: 502 },
+      );
     }
 
     return new Response("Not found", { status: 404 });
   },
 });
 
-console.log(`coolify-logs-proxy listening on :${PORT}`);
+console.log(`coolify-logs-proxy listening on :${PORT}, gating ${GITHUB_ORG}`);
