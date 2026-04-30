@@ -18,20 +18,24 @@ type CoolifyApp = {
   git_repository?: string;
 };
 
-type DeploymentSummary = {
-  uuid: string;
-  status: string;
-  git_commit_sha?: string;
+type DeploymentItem = {
+  deployment_uuid?: string;
+  status?: string;
   commit?: string;
+  git_commit_sha?: string;
+  commit_message?: string | null;
   created_at?: string;
   updated_at?: string;
+  finished_at?: string | null;
+  deployment_url?: string;
+  logs?: string;
 };
 
-type DeploymentDetail = DeploymentSummary & {
-  logs?: string;
-  deployment_url?: string;
-  commit_message?: string;
-  application_name?: string;
+type LogEntry = {
+  output?: string;
+  type?: string;
+  hidden?: boolean;
+  timestamp?: string;
 };
 
 type AppCacheEntry = { apps: CoolifyApp[]; fetchedAt: number };
@@ -76,15 +80,35 @@ function findAppByRepo(apps: CoolifyApp[], repo: string): CoolifyApp | undefined
   });
 }
 
-function tailLines(text: string | undefined, n: number): string {
-  if (!text) return "";
+function tailLines(text: string, n: number): string {
   const lines = text.split(/\r?\n/);
   if (lines.length <= n) return text;
   return lines.slice(-n).join("\n");
 }
 
-function deploymentSha(d: DeploymentSummary): string | undefined {
+function deploymentSha(d: DeploymentItem): string | undefined {
   return d.git_commit_sha ?? d.commit;
+}
+
+function shaMatches(deploymentSha: string, query: string): boolean {
+  if (!deploymentSha || !query) return false;
+  return deploymentSha.startsWith(query) || query.startsWith(deploymentSha);
+}
+
+function flattenLogs(rawLogs: string | undefined, max: number): string {
+  if (!rawLogs) return "";
+  let entries: LogEntry[];
+  try {
+    const parsed = JSON.parse(rawLogs);
+    if (!Array.isArray(parsed)) return tailLines(rawLogs, max);
+    entries = parsed as LogEntry[];
+  } catch {
+    return tailLines(rawLogs, max);
+  }
+  const visible = entries
+    .filter((e) => !e.hidden && typeof e.output === "string")
+    .map((e) => e.output as string);
+  return tailLines(visible.join("\n"), max);
 }
 
 async function handleLogs(repo: string, sha: string): Promise<Response> {
@@ -97,26 +121,24 @@ async function handleLogs(repo: string, sha: string): Promise<Response> {
   const rawList = await coolify<unknown>(
     `/api/v1/deployments/applications/${app.uuid}?take=20`,
   );
-  const list = unwrapList<DeploymentSummary>(rawList);
+  const list = unwrapList<DeploymentItem>(rawList);
   const match =
-    list.find((d) => {
-      const dsha = deploymentSha(d) ?? "";
-      return dsha.startsWith(sha) || (dsha !== "" && sha.startsWith(dsha));
-    }) ?? list[0];
+    list.find((d) => shaMatches(deploymentSha(d) ?? "", sha)) ?? list[0];
 
   if (!match) {
     return Response.json({ status: "not_found", reason: "deployment" }, { status: 404 });
   }
 
-  const detail = await coolify<DeploymentDetail>(`/api/v1/deployments/${match.uuid}`);
   return Response.json({
-    status: detail.status ?? match.status,
-    commit: deploymentSha(detail) ?? deploymentSha(match) ?? null,
-    commit_message: detail.commit_message ?? null,
-    deployment_url: detail.deployment_url ?? null,
-    started_at: detail.created_at ?? match.created_at ?? null,
-    updated_at: detail.updated_at ?? match.updated_at ?? null,
-    logs: tailLines(detail.logs, LOG_LINES),
+    status: match.status ?? null,
+    commit: deploymentSha(match) ?? null,
+    commit_message: match.commit_message ?? null,
+    deployment_uuid: match.deployment_uuid ?? null,
+    deployment_url: match.deployment_url ?? null,
+    started_at: match.created_at ?? null,
+    updated_at: match.updated_at ?? null,
+    finished_at: match.finished_at ?? null,
+    logs: flattenLogs(match.logs, LOG_LINES),
   });
 }
 
