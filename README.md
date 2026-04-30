@@ -50,6 +50,26 @@ crash loops, missing env vars, etc.).
 
 Liveness probe — does not require auth.
 
+### `POST /webhooks/github`
+
+GitHub-org webhook endpoint. Listens for `repository.deleted` events
+and tears down the matching Coolify resources (the application and
+its `db-{repo}` Postgres database). Authentication is HMAC-SHA-256
+on the request body, verified against `GITHUB_WEBHOOK_SECRET`. Other
+event types are acknowledged with 200 and ignored.
+
+To wire it up in the GitHub org:
+
+1. Org Settings → Webhooks → Add webhook
+2. Payload URL: `https://coolify-logs.proto-beta.fr/webhooks/github`
+3. Content type: `application/json`
+4. Secret: a long random string. Set the same value as
+   `GITHUB_WEBHOOK_SECRET` on the proxy's environment.
+5. SSL verification: enabled.
+6. Which events: select **Let me select individual events** →
+   tick only **Repositories**.
+7. Save.
+
 ## Authentication
 
 All endpoints except `/healthz` require:
@@ -88,6 +108,11 @@ name, not the full owner path.
 4. Environment variables (Settings → Environment Variables):
    - `COOLIFY_BASE_URL` = `https://coolify.proto-beta.fr`
    - `COOLIFY_TOKEN` = the **read-only** Coolify API token
+   - `COOLIFY_TOKEN_WRITE` = the **write-scoped** Coolify API token
+     (only needed for the cleanup webhook; can be the same one used
+     by the org's GitHub Actions secrets)
+   - `GITHUB_WEBHOOK_SECRET` = a long random string (also configured
+     in the GitHub org webhook settings)
    - `GITHUB_ORG` = `betagouv-experimentations` (optional, default)
 5. Deploy.
 

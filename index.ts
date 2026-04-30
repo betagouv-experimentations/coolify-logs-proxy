@@ -11,7 +11,9 @@
 
 const COOLIFY_BASE_URL = requireEnv("COOLIFY_BASE_URL").replace(/\/$/, "");
 const COOLIFY_TOKEN = requireEnv("COOLIFY_TOKEN");
+const COOLIFY_TOKEN_WRITE = process.env.COOLIFY_TOKEN_WRITE ?? "";
 const GITHUB_ORG = process.env.GITHUB_ORG ?? "betagouv-experimentations";
+const GITHUB_WEBHOOK_SECRET = process.env.GITHUB_WEBHOOK_SECRET ?? "";
 const PORT = Number(process.env.PORT ?? 3000);
 const LOG_LINES = Number(process.env.LOG_LINES ?? 200);
 const APP_CACHE_TTL_MS = Number(process.env.APP_CACHE_TTL_MS ?? 5 * 60 * 1000);
@@ -23,6 +25,14 @@ type CoolifyApp = {
   uuid: string;
   name?: string;
   git_repository?: string;
+  project_uuid?: string;
+  environment_name?: string;
+};
+
+type CoolifyDatabase = {
+  uuid: string;
+  name?: string;
+  project_uuid?: string;
 };
 
 type DeploymentItem = {
@@ -61,14 +71,27 @@ class CoolifyError extends Error {
   }
 }
 
-async function coolify<T>(path: string): Promise<T> {
+async function coolify<T>(
+  path: string,
+  init: { method?: string; token?: string } = {},
+): Promise<T> {
+  const method = init.method ?? "GET";
+  const token = init.token ?? COOLIFY_TOKEN;
   const res = await fetch(`${COOLIFY_BASE_URL}${path}`, {
-    headers: { Authorization: `Bearer ${COOLIFY_TOKEN}` },
+    method,
+    headers: { Authorization: `Bearer ${token}` },
   });
   if (!res.ok) {
     throw new CoolifyError(res.status, path, await res.text());
   }
-  return res.json() as Promise<T>;
+  if (res.status === 204) return undefined as T;
+  const text = await res.text();
+  if (!text) return undefined as T;
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    return text as unknown as T;
+  }
 }
 
 function parseCoolifyErrorMessage(body: string): string | null {
@@ -264,6 +287,124 @@ function extractBearer(req: Request): string | null {
   return m ? m[1]!.trim() : null;
 }
 
+async function verifyGithubSignature(
+  req: Request,
+  rawBody: string,
+): Promise<boolean> {
+  if (!GITHUB_WEBHOOK_SECRET) return false;
+  const header =
+    req.headers.get("x-hub-signature-256") ?? req.headers.get("X-Hub-Signature-256");
+  if (!header) return false;
+  const expected = header.replace(/^sha256=/, "");
+
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    enc.encode(GITHUB_WEBHOOK_SECRET),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const sigBytes = await crypto.subtle.sign("HMAC", key, enc.encode(rawBody));
+  const computed = Array.from(new Uint8Array(sigBytes))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+
+  if (expected.length !== computed.length) return false;
+  let mismatch = 0;
+  for (let i = 0; i < expected.length; i++) {
+    mismatch |= expected.charCodeAt(i) ^ computed.charCodeAt(i);
+  }
+  return mismatch === 0;
+}
+
+async function handleRepositoryDeleted(
+  repoName: string,
+  fullName: string,
+): Promise<{ ok: boolean; deletedApp: boolean; deletedDb: boolean; notes: string[] }> {
+  const notes: string[] = [];
+  if (!COOLIFY_TOKEN_WRITE) {
+    notes.push("COOLIFY_TOKEN_WRITE not configured; refusing to delete.");
+    return { ok: false, deletedApp: false, deletedDb: false, notes };
+  }
+
+  const apps = await listApps();
+  const app = findAppByRepo(apps, repoName);
+
+  let deletedApp = false;
+  let deletedDb = false;
+
+  if (!app) {
+    notes.push(`No Coolify app found whose git_repository ends with /${repoName}.`);
+  } else {
+    notes.push(`Found app ${app.uuid} (${app.name ?? "?"}) for ${fullName}.`);
+    try {
+      await coolify(`/api/v1/applications/${app.uuid}/stop`, {
+        method: "POST",
+        token: COOLIFY_TOKEN_WRITE,
+      });
+    } catch (err) {
+      notes.push(`Stop application failed (continuing): ${(err as Error).message}`);
+    }
+    try {
+      await coolify(`/api/v1/applications/${app.uuid}`, {
+        method: "DELETE",
+        token: COOLIFY_TOKEN_WRITE,
+      });
+      deletedApp = true;
+      notes.push("Application deleted.");
+    } catch (err) {
+      notes.push(`Delete application failed: ${(err as Error).message}`);
+    }
+  }
+
+  // Find DBs whose name matches db-{repo-name} and that are in the same
+  // project as the app (when we know the project).
+  try {
+    const rawDbs = await coolify<unknown>("/api/v1/databases");
+    const dbs = unwrapList<CoolifyDatabase>(rawDbs);
+    const expectedName = `db-${repoName}`;
+    const candidates = dbs.filter((d) => {
+      const nameMatches = d.name === expectedName;
+      const projectMatches = !app?.project_uuid || d.project_uuid === app.project_uuid;
+      return nameMatches && projectMatches;
+    });
+
+    if (candidates.length === 0) {
+      notes.push(`No Coolify database found with name ${expectedName}.`);
+    }
+
+    for (const db of candidates) {
+      try {
+        await coolify(`/api/v1/databases/${db.uuid}/stop`, {
+          method: "POST",
+          token: COOLIFY_TOKEN_WRITE,
+        });
+      } catch (err) {
+        notes.push(`Stop database ${db.uuid} failed (continuing): ${(err as Error).message}`);
+      }
+      try {
+        await coolify(`/api/v1/databases/${db.uuid}`, {
+          method: "DELETE",
+          token: COOLIFY_TOKEN_WRITE,
+        });
+        deletedDb = true;
+        notes.push(`Database ${db.uuid} (${db.name}) deleted.`);
+      } catch (err) {
+        notes.push(`Delete database ${db.uuid} failed: ${(err as Error).message}`);
+      }
+    }
+  } catch (err) {
+    notes.push(`List databases failed: ${(err as Error).message}`);
+  }
+
+  // Invalidate the app cache so subsequent /logs calls don't hit the
+  // deleted app.
+  appCache = null;
+
+  return { ok: deletedApp || deletedDb, deletedApp, deletedDb, notes };
+}
+
 function requireEnv(name: string): string {
   const value = process.env[name];
   if (!value) {
@@ -283,6 +424,52 @@ Bun.serve({
 
     if (req.method === "GET" && url.pathname === "/healthz") {
       return Response.json({ ok: true });
+    }
+
+    if (req.method === "POST" && url.pathname === "/webhooks/github") {
+      const rawBody = await req.text();
+      const validSig = await verifyGithubSignature(req, rawBody);
+      if (!validSig) {
+        return Response.json(
+          { error: "invalid_signature" },
+          { status: 401 },
+        );
+      }
+      const event = req.headers.get("x-github-event") ?? "";
+      let payload: Record<string, unknown> = {};
+      try {
+        payload = JSON.parse(rawBody) as Record<string, unknown>;
+      } catch {
+        return Response.json({ error: "invalid_json" }, { status: 400 });
+      }
+      const action = typeof payload.action === "string" ? payload.action : "";
+      const repository = (payload.repository ?? {}) as {
+        name?: string;
+        full_name?: string;
+      };
+
+      if (event === "repository" && action === "deleted" && repository.name) {
+        try {
+          const result = await handleRepositoryDeleted(
+            repository.name,
+            repository.full_name ?? repository.name,
+          );
+          console.log(
+            `repository.deleted ${repository.full_name}: app=${result.deletedApp} db=${result.deletedDb}`,
+          );
+          for (const n of result.notes) console.log(`  - ${n}`);
+          return Response.json({ ok: result.ok, ...result });
+        } catch (err) {
+          console.error("webhook cleanup error:", err);
+          return Response.json(
+            { error: "cleanup_failed", message: (err as Error).message },
+            { status: 502 },
+          );
+        }
+      }
+
+      // Acknowledge unrelated events so GitHub stops retrying.
+      return Response.json({ ok: true, ignored: { event, action } });
     }
 
     if (req.method !== "GET") {
