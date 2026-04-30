@@ -51,14 +51,33 @@ let appCache: AppCacheEntry | null = null;
 type MembershipResult = { ok: boolean; checkedAt: number; login?: string };
 const membershipCache = new Map<string, MembershipResult>();
 
+class CoolifyError extends Error {
+  constructor(
+    public status: number,
+    public path: string,
+    public body: string,
+  ) {
+    super(`Coolify ${status} on ${path}: ${body}`);
+  }
+}
+
 async function coolify<T>(path: string): Promise<T> {
   const res = await fetch(`${COOLIFY_BASE_URL}${path}`, {
     headers: { Authorization: `Bearer ${COOLIFY_TOKEN}` },
   });
   if (!res.ok) {
-    throw new Error(`Coolify ${res.status} on ${path}: ${await res.text()}`);
+    throw new CoolifyError(res.status, path, await res.text());
   }
   return res.json() as Promise<T>;
+}
+
+function parseCoolifyErrorMessage(body: string): string | null {
+  try {
+    const parsed = JSON.parse(body) as { message?: unknown };
+    return typeof parsed.message === "string" ? parsed.message : null;
+  } catch {
+    return null;
+  }
 }
 
 function unwrapList<T>(payload: unknown): T[] {
@@ -166,9 +185,28 @@ async function handleRuntimeLogs(repo: string, lines: number): Promise<Response>
     return Response.json({ status: "not_found", reason: "app" }, { status: 404 });
   }
 
-  const raw = await coolify<{ logs?: string } | unknown>(
-    `/api/v1/applications/${app.uuid}/logs?lines=${lines}`,
-  );
+  let raw: unknown;
+  try {
+    raw = await coolify<unknown>(
+      `/api/v1/applications/${app.uuid}/logs?lines=${lines}`,
+    );
+  } catch (err) {
+    if (err instanceof CoolifyError && (err.status === 400 || err.status === 404)) {
+      const message = parseCoolifyErrorMessage(err.body) ?? "Application is not running.";
+      return Response.json(
+        {
+          status: "not_running",
+          repo,
+          app_uuid: app.uuid,
+          message,
+          hint: "The container is not currently running, so there are no live logs to read. Check the latest build logs via /logs/{repo}/{sha} for the failure cause.",
+        },
+        { status: 200 },
+      );
+    }
+    throw err;
+  }
+
   const logs =
     raw && typeof raw === "object" && "logs" in raw && typeof (raw as { logs?: unknown }).logs === "string"
       ? ((raw as { logs: string }).logs)
@@ -177,6 +215,7 @@ async function handleRuntimeLogs(repo: string, lines: number): Promise<Response>
       : "";
 
   return Response.json({
+    status: "running",
     repo,
     app_uuid: app.uuid,
     lines: logs.split(/\r?\n/).length,
