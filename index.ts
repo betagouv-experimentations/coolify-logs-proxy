@@ -143,10 +143,17 @@ Bun.serve({
     if (req.method === "GET" && url.pathname === "/_debug/apps") {
       try {
         const raw = await coolify<unknown>("/api/v1/applications");
+        const list = unwrapList<Record<string, unknown>>(raw);
         return Response.json({
           shape: Array.isArray(raw) ? "array" : typeof raw,
-          keys: raw && typeof raw === "object" ? Object.keys(raw) : null,
-          sample: Array.isArray(raw) ? raw.slice(0, 1) : raw,
+          count: list.length,
+          summary: list.map((a) => ({
+            uuid: a.uuid,
+            name: a.name,
+            git_repository: a.git_repository,
+            git_branch: a.git_branch,
+            fqdn: a.fqdn,
+          })),
         });
       } catch (err) {
         return Response.json({ error: (err as Error).message }, { status: 502 });
@@ -161,10 +168,13 @@ Bun.serve({
         const raw = await coolify<unknown>(
           `/api/v1/deployments/applications/${debugDeploy[1]}?take=5`,
         );
+        const list = unwrapList<Record<string, unknown>>(raw);
         return Response.json({
-          shape: Array.isArray(raw) ? "array" : typeof raw,
-          keys: raw && typeof raw === "object" ? Object.keys(raw) : null,
-          sample: Array.isArray(raw) ? raw.slice(0, 1) : raw,
+          rawShape: Array.isArray(raw) ? "array" : typeof raw,
+          rawKeys: raw && typeof raw === "object" && !Array.isArray(raw) ? Object.keys(raw) : null,
+          count: list.length,
+          itemKeys: list[0] ? Object.keys(list[0]) : [],
+          sample: list.slice(0, 2),
         });
       } catch (err) {
         return Response.json({ error: (err as Error).message }, { status: 502 });
